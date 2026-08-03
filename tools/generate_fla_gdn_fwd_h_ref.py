@@ -21,7 +21,7 @@ CHUNK_SIZE = 64
 
 
 def dtype_of(name: str) -> torch.dtype:
-    return {"fp16": torch.float16, "bf16": torch.bfloat16}[name]
+    return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[name]
 
 
 def cu_of(value: str, batch: int, seqlen: int) -> list[int] | None:
@@ -75,6 +75,7 @@ def main():
     p.add_argument("dtype", choices=["fp16", "bf16"]); p.add_argument("cu_seqlens")
     p.add_argument("use_initial_state", type=int, choices=[0, 1]); p.add_argument("use_final_state", type=int, choices=[0, 1])
     p.add_argument("--output_dir", type=Path, default=Path("/tmp/gdn_fwd_h_ref")); p.add_argument("--seed", type=int, default=24)
+    p.add_argument("--state_dtype", choices=["fp16", "bf16", "fp32"], default="fp32")
     args = p.parse_args()
     if args.chunk_size != CHUNK_SIZE or args.vH < args.kH or args.vH % args.kH:
         raise ValueError("chunk_size must be 64 and vH must be divisible by kH")
@@ -87,25 +88,54 @@ def main():
     if not torch.npu.is_available():
         raise RuntimeError("No Ascend NPU is available")
     device = "npu"
-    k = torch.randn(args.B, args.T, args.kH, args.D, device=device, dtype=dtype)
-    w = torch.randn(args.B, args.T, args.vH, args.D, device=device, dtype=dtype)
-    u = torch.randn(args.B, args.T, args.vH, args.VDim, device=device, dtype=dtype)
-    g = torch.empty(args.B, args.T, args.vH, device=device, dtype=torch.float32).uniform_(-16, -0.1)
-    g_cpu = g.cpu()
-    spans = [(b, 0, args.T) for b in range(args.B)] if cu is None else [(0, a, b) for a, b in zip(cu, cu[1:])]
-    for seq, start, end in spans:
-        for chunk_start in range(start, end, CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, end)
-            g_cpu[seq, chunk_start:chunk_end] = g_cpu[seq, chunk_start:chunk_end].cumsum(0)
-    g = g_cpu.to(device)
-    nseq = args.B if cu is None else len(cu) - 1
-    initial = torch.randn(nseq, args.vH, args.D, args.VDim, device=device, dtype=dtype) if args.use_initial_state else None
-    fp32_h, fp32_v_new, fp32_final = fwd_h_reference(k, w, u, g, initial, cu, bool(args.use_final_state))
     install_minimal_vllm_shim()
     install_lightweight_ascend_packages()
     from vllm_ascend.ops.triton.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+    from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+    from vllm_ascend.ops.triton.fla.cumsum import chunk_local_cumsum
+    from vllm_ascend.ops.triton.fla.solve_tril import solve_tril
+    from vllm_ascend.ops.triton.fla.utils import prepare_chunk_indices
+    from vllm_ascend.ops.triton.fla.wy_fast import recompute_w_u_fwd
 
+    # Build w/u through the same WY pipeline used by chunk_gated_delta_rule.
+    k = torch.normal(0.0109, 0.0979, (args.B, args.T, args.kH, args.D), device=device, dtype=dtype)
+    raw_v = torch.normal(0.0168, 0.1328, (args.B, args.T, args.vH, args.VDim), device=device, dtype=dtype)
+    beta = torch.empty(args.B, args.T, args.vH, device=device, dtype=dtype).uniform_(0.12, 0.88)
+    raw_g = torch.empty(args.B, args.T, args.vH, device=device, dtype=torch.float32).uniform_(-0.08, -0.002)
     cu_tensor = None if cu is None else torch.tensor(cu, device=device, dtype=torch.long)
+    chunk_indices = None if cu_tensor is None else prepare_chunk_indices(cu_tensor, CHUNK_SIZE)
+    g = chunk_local_cumsum(raw_g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_tensor)
+    a_matrix = chunk_scaled_dot_kkt_fwd(
+        k=k,
+        beta=beta,
+        g_cumsum=g,
+        cu_seqlens=cu_tensor,
+        chunk_indices=chunk_indices,
+        output_dtype=torch.float32,
+    )
+    a_matrix = solve_tril(
+        A=a_matrix,
+        cu_seqlens=cu_tensor,
+        chunk_indices_bt=chunk_indices,
+        output_dtype=k.dtype,
+    )
+    w, u = recompute_w_u_fwd(
+        k=k,
+        v=raw_v,
+        beta=beta,
+        g_cumsum=g,
+        A=a_matrix,
+        cu_seqlens=cu_tensor,
+        chunk_indices=chunk_indices,
+    )
+    nseq = args.B if cu is None else len(cu) - 1
+    state_dtype = dtype_of(args.state_dtype)
+    initial = (
+        torch.normal(0.0, 0.02, (nseq, args.vH, args.D, args.VDim), device=device, dtype=state_dtype)
+        if args.use_initial_state
+        else None
+    )
+    fp32_h, fp32_v_new, fp32_final = fwd_h_reference(k, w, u, g, initial, cu, bool(args.use_final_state))
     h, v_new, final = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -135,6 +165,10 @@ def main():
             "w": w.cpu(),
             "u": u.cpu(),
             "g": g.cpu(),
+            "raw_v": raw_v.cpu(),
+            "raw_g": raw_g.cpu(),
+            "beta": beta.cpu(),
+            "A": a_matrix.cpu(),
             "initial_state": None if initial is None else initial.cpu(),
             "h": h.cpu(),
             "v_new": v_new.cpu(),
