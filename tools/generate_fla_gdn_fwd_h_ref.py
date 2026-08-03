@@ -127,6 +127,8 @@ def main():
     suffix = f"_var_{len(cu)-1}" if cu else ""
     path = args.output_dir / f"{args.B}_{args.kH}_{args.vH}_{args.T}_{args.D}_{args.VDim}_{args.chunk_size}_{args.dtype}{suffix}.pt"
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    config = vars(args).copy()
+    config["output_dir"] = str(args.output_dir)
     torch.save(
         {
             "k": k.cpu(),
@@ -142,7 +144,7 @@ def main():
             "fp32_final_state": fp32_final,
             "cu_seqlens": None if cu is None else torch.tensor(cu),
             "accuracy": accuracy,
-            "config": vars(args),
+            "config": config,
         },
         path,
     )
