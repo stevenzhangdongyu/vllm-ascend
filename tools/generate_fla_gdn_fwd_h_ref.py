@@ -33,6 +33,28 @@ def cu_of(value: str, batch: int, seqlen: int) -> list[int] | None:
     return cu
 
 
+def solve_tril_cpu(a_matrix: torch.Tensor, cu_seqlens: list[int] | None) -> torch.Tensor:
+    """Compute (I + A)^-1 per chunk when Ascend950 cannot compile solve_tril."""
+    source = a_matrix.detach().cpu().float()
+    result = torch.empty_like(source)
+    batch, seqlen, heads, chunk_size = source.shape
+    spans = (
+        [(batch_idx, 0, seqlen) for batch_idx in range(batch)]
+        if cu_seqlens is None
+        else [(0, start, end) for start, end in zip(cu_seqlens, cu_seqlens[1:])]
+    )
+    identity = torch.eye(chunk_size, dtype=torch.float32)
+    for batch_idx, start, end in spans:
+        for chunk_start in range(start, end, chunk_size):
+            valid = min(chunk_size, end - chunk_start)
+            for head_idx in range(heads):
+                block = source[batch_idx, chunk_start : chunk_start + valid, head_idx, :valid]
+                inverse = torch.linalg.inv(identity[:valid, :valid] + block)
+                result[batch_idx, chunk_start : chunk_start + valid, head_idx].zero_()
+                result[batch_idx, chunk_start : chunk_start + valid, head_idx, :valid] = inverse
+    return result.to(dtype=a_matrix.dtype, device=a_matrix.device)
+
+
 def fwd_h_reference(k, w, u, g, initial_state, cu_seqlens, output_final_state):
     k, w, u, g = [x.detach().cpu().float() for x in (k, w, u, g)]
     bsz, seqlen, kh, dim = k.shape
@@ -93,7 +115,6 @@ def main():
     from vllm_ascend.ops.triton.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
     from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
     from vllm_ascend.ops.triton.fla.cumsum import chunk_local_cumsum
-    from vllm_ascend.ops.triton.fla.solve_tril import solve_tril
     from vllm_ascend.ops.triton.fla.utils import prepare_chunk_indices
     from vllm_ascend.ops.triton.fla.wy_fast import recompute_w_u_fwd
 
@@ -113,12 +134,7 @@ def main():
         chunk_indices=chunk_indices,
         output_dtype=torch.float32,
     )
-    a_matrix = solve_tril(
-        A=a_matrix,
-        cu_seqlens=cu_tensor,
-        chunk_indices_bt=chunk_indices,
-        output_dtype=k.dtype,
-    )
+    a_matrix = solve_tril_cpu(a_matrix, cu)
     w, u = recompute_w_u_fwd(
         k=k,
         v=raw_v,
