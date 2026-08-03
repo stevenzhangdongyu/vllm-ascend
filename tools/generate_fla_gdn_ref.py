@@ -232,17 +232,29 @@ def generate_reference(args: argparse.Namespace) -> Path:
     cu_tensor = None if cu_seqlens is None else torch.tensor(cu_seqlens, device=device, dtype=torch.long)
     scale = args.scale if args.scale is not None else args.D**-0.5
 
-    synchronize(device)
-    ref_o, final_state = chunk_gated_delta_rule(
-        **tensors,
-        scale=scale,
-        initial_state=None,
-        output_final_state=True,
-        cu_seqlens=cu_tensor,
-        head_first=False,
-    )
-    synchronize(device)
     fp32_o, fp32_final_state = recurrent_reference(**tensors, scale=scale, cu_seqlens=cu_seqlens)
+    kernel_status = "executed"
+    kernel_error = None
+    try:
+        synchronize(device)
+        ref_o, final_state = chunk_gated_delta_rule(
+            **tensors,
+            scale=scale,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu_tensor,
+            head_first=False,
+        )
+        synchronize(device)
+    except Exception as exc:  # Triton/CANN compiler errors are backend-specific.
+        if not args.allow_fallback:
+            raise
+        kernel_status = "fallback_recurrent"
+        kernel_error = f"{type(exc).__name__}: {exc}"
+        ref_o = fp32_o.to(dtype)
+        final_state = fp32_final_state.to(dtype)
+        print("[Warning] FLA kernel failed; saving CPU FP32 recurrent fallback.")
+        print(f"[Warning] {kernel_error.splitlines()[0]}")
 
     metrics = {
         "output": accuracy_metrics(ref_o, fp32_o),
@@ -261,6 +273,8 @@ def generate_reference(args: argparse.Namespace) -> Path:
         "seed": args.seed,
         "device_type": device.type,
         "device": device_name(device),
+        "kernel_status": kernel_status,
+        "kernel_error": kernel_error,
     }
     suffix = f"_var_{len(cu_seqlens) - 1}" if cu_seqlens is not None else ""
     path = args.output_dir / (
@@ -283,7 +297,8 @@ def generate_reference(args: argparse.Namespace) -> Path:
         path,
     )
     print(f"[Info] Tensor data saved successfully to: {path}")
-    print(f"[Accuracy] {device.type.upper()} FLA vs CPU FP32 recurrent reference")
+    result_label = f"{device.type.upper()} FLA" if kernel_status == "executed" else "recurrent fallback"
+    print(f"[Accuracy] {result_label} vs CPU FP32 recurrent reference")
     for name, values in metrics.items():
         formatted = ", ".join(f"{key}={value:.6e}" for key, value in values.items())
         print(f"  {name}: {formatted}")
@@ -305,6 +320,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=24)
     parser.add_argument("--device", choices=["auto", "cuda", "npu"], default="auto")
+    parser.add_argument(
+        "--no-fallback",
+        dest="allow_fallback",
+        action="store_false",
+        help="Propagate FLA/Triton compilation errors instead of saving recurrent fallback data",
+    )
+    parser.set_defaults(allow_fallback=True)
     return parser.parse_args()
 
 
