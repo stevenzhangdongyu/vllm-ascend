@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -131,6 +133,62 @@ def device_name(device: torch.device) -> str:
     return get_device_name(torch.npu.current_device()) if get_device_name else "Ascend NPU"
 
 
+def install_minimal_vllm_shim() -> None:
+    """Provide the small vLLM API surface used by the copied FLA kernels."""
+    try:
+        import vllm  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import triton
+    import triton.language as tl
+
+    vllm = types.ModuleType("vllm")
+    vllm.__path__ = []
+    triton_utils = types.ModuleType("vllm.triton_utils")
+    triton_utils.HAS_TRITON = True
+    triton_utils.tl = tl
+    triton_utils.triton = triton
+    forward_context = types.ModuleType("vllm.forward_context")
+    forward_context.get_forward_context = lambda: types.SimpleNamespace(attn_metadata=None)
+    distributed = types.ModuleType("vllm.distributed")
+    distributed.get_pcp_group = lambda: types.SimpleNamespace(world_size=1, rank_in_group=0)
+    utils = types.ModuleType("vllm.model_executor.layers.fla.ops.utils")
+    utils.SUPPRESS_LEVEL = 3
+
+    modules = {
+        "vllm": vllm,
+        "vllm.triton_utils": triton_utils,
+        "vllm.forward_context": forward_context,
+        "vllm.distributed": distributed,
+        "vllm.model_executor": types.ModuleType("vllm.model_executor"),
+        "vllm.model_executor.layers": types.ModuleType("vllm.model_executor.layers"),
+        "vllm.model_executor.layers.fla": types.ModuleType("vllm.model_executor.layers.fla"),
+        "vllm.model_executor.layers.fla.ops": types.ModuleType("vllm.model_executor.layers.fla.ops"),
+        "vllm.model_executor.layers.fla.ops.utils": utils,
+    }
+    sys.modules.update(modules)
+    vllm.triton_utils = triton_utils
+    vllm.forward_context = forward_context
+    vllm.distributed = distributed
+
+
+def install_lightweight_ascend_packages() -> None:
+    """Bypass vllm_ascend.ops.__init__, which imports the full vLLM stack."""
+    repo_root = Path(__file__).resolve().parents[1]
+    package_paths = {
+        "vllm_ascend.ops": repo_root / "vllm_ascend" / "ops",
+        "vllm_ascend.ops.triton": repo_root / "vllm_ascend" / "ops" / "triton",
+        "vllm_ascend.ops.triton.fla": repo_root / "vllm_ascend" / "ops" / "triton" / "fla",
+    }
+    for name, path in package_paths.items():
+        module = types.ModuleType(name)
+        module.__path__ = [str(path)]
+        module.__package__ = name
+        sys.modules[name] = module
+
+
 def accuracy_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     actual, expected = actual.detach().cpu().float(), expected.detach().cpu().float()
     error = (actual - expected).abs()
@@ -159,6 +217,8 @@ def generate_reference(args: argparse.Namespace) -> Path:
     if device.type == "cuda":
         from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule
     else:
+        install_minimal_vllm_shim()
+        install_lightweight_ascend_packages()
         import vllm_ascend.ops.triton.fla.chunk as ascend_chunk
 
         # The kernel only needs PCP collectives when world_size > 1. Keep this
