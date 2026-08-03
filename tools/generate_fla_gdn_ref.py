@@ -72,8 +72,8 @@ def recurrent_reference(
     beta: torch.Tensor,
     scale: float,
     cu_seqlens: list[int] | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the GDN recurrence in float32 on CPU."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the recurrence and chunk_fwd_o inputs in float32 on CPU."""
     q, k, v, g, beta = (tensor.detach().cpu() for tensor in (q, k, v, g, beta))
     batch, seqlen, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
@@ -88,20 +88,34 @@ def recurrent_reference(
         spans = [(0, start, end) for start, end in zip(cu_seqlens, cu_seqlens[1:])]
 
     output = torch.empty(batch, seqlen, value_heads, value_dim, device=q.device, dtype=torch.float32)
+    v_new = torch.empty_like(v)
+    g_cumsum = torch.empty_like(g)
+    chunk_states: list[torch.Tensor] = []
     final_states = []
     for batch_idx, start, end in spans:
         state = torch.zeros(value_heads, key_dim, value_dim, device=q.device, dtype=torch.float32)
         for token_idx in range(start, end):
+            if (token_idx - start) % GDN_CHUNK_SIZE == 0:
+                chunk_states.append(state.clone())
+                chunk_g = torch.zeros(value_heads, dtype=torch.float32)
             q_t = q[batch_idx, token_idx]
             k_t = k[batch_idx, token_idx]
             v_t = v[batch_idx, token_idx]
             state.mul_(g[batch_idx, token_idx].exp()[:, None, None])
             prediction = torch.einsum("hkv,hk->hv", state, k_t)
             delta = (v_t - prediction) * beta[batch_idx, token_idx, :, None]
+            v_new[batch_idx, token_idx] = delta
+            chunk_g.add_(g[batch_idx, token_idx])
+            g_cumsum[batch_idx, token_idx] = chunk_g
             state.add_(torch.einsum("hk,hv->hkv", k_t, delta))
             output[batch_idx, token_idx] = torch.einsum("hk,hkv->hv", q_t, state)
         final_states.append(state.clone())
-    return output, torch.stack(final_states)
+    if cu_seqlens is None:
+        num_chunks = (seqlen + GDN_CHUNK_SIZE - 1) // GDN_CHUNK_SIZE
+        h = torch.stack(chunk_states).reshape(batch, num_chunks, value_heads, key_dim, value_dim)
+    else:
+        h = torch.stack(chunk_states).unsqueeze(0)
+    return output, torch.stack(final_states), v_new, h, g_cumsum
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -232,7 +246,9 @@ def generate_reference(args: argparse.Namespace) -> Path:
     cu_tensor = None if cu_seqlens is None else torch.tensor(cu_seqlens, device=device, dtype=torch.long)
     scale = args.scale if args.scale is not None else args.D**-0.5
 
-    fp32_o, fp32_final_state = recurrent_reference(**tensors, scale=scale, cu_seqlens=cu_seqlens)
+    fp32_o, fp32_final_state, fwd_o_v, fwd_o_h, fwd_o_g = recurrent_reference(
+        **tensors, scale=scale, cu_seqlens=cu_seqlens
+    )
     kernel_status = "executed"
     kernel_error = None
     try:
@@ -284,7 +300,14 @@ def generate_reference(args: argparse.Namespace) -> Path:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            **{name: to_cpu(tensor) for name, tensor in tensors.items()},
+            "q": to_cpu(tensors["q"]),
+            "k": to_cpu(tensors["k"]),
+            "v": fwd_o_v.to(dtype),
+            "h": fwd_o_h.to(dtype),
+            "g": fwd_o_g,
+            "raw_v": to_cpu(tensors["v"]),
+            "raw_g": to_cpu(tensors["g"]),
+            "beta": to_cpu(tensors["beta"]),
             "scale": scale,
             "ref_o": to_cpu(ref_o),
             "final_state": to_cpu(final_state),
