@@ -98,8 +98,8 @@ def main():
     args = p.parse_args()
     if args.chunk_size <= 0 or args.vH < args.kH or args.vH % args.kH:
         raise ValueError("chunk_size must be positive and vH must be divisible by kH")
-    if args.chunk_size not in {16, 32, 64}:
-        raise ValueError("the current solve_tril/WY pipeline supports chunk_size 16, 32, or 64")
+    if args.chunk_size not in {64, 128}:
+        raise ValueError("the current solve_tril/WY pipeline supports chunk_size 64 or 128")
     torch.manual_seed(args.seed)
     dtype, cu = dtype_of(args.dtype), cu_of(args.cu_seqlens, args.B, args.T)
     try:
@@ -180,7 +180,7 @@ def main():
     if final is not None:
         accuracy["final_state"] = accuracy_metrics(final, fp32_final)
     suffix = f"_var_{len(cu)-1}" if cu else ""
-    path = args.output_dir / f"{args.B}_{args.kH}_{args.vH}_{args.T}_{args.D}_{args.VDim}_{args.chunk_size}_{args.dtype}{suffix}.pt"
+    path = args.output_dir / f"{args.B}_{args.kH}_{args.vH}_{args.T}_{args.D}_{args.VDim}_{args.chunk_size}_{args.dtype}{suffix}_{args.use_initial_state}_{args.use_final_state}.pt"
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = vars(args).copy()
     config["output_dir"] = str(args.output_dir)
