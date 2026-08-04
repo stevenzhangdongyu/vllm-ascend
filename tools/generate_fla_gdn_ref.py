@@ -15,14 +15,12 @@ import ast
 import sys
 import types
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
 
-GDN_CHUNK_SIZE = 64
 DEFAULT_OUTPUT_DIR = Path("/tmp/gdn_vllm_ref")
 
 
@@ -72,6 +70,7 @@ def recurrent_reference(
     beta: torch.Tensor,
     scale: float,
     cu_seqlens: list[int] | None,
+    chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the recurrence and chunk_fwd_o inputs in float32 on CPU."""
     q, k, v, g, beta = (tensor.detach().cpu() for tensor in (q, k, v, g, beta))
@@ -95,7 +94,7 @@ def recurrent_reference(
     for batch_idx, start, end in spans:
         state = torch.zeros(value_heads, key_dim, value_dim, device=q.device, dtype=torch.float32)
         for token_idx in range(start, end):
-            if (token_idx - start) % GDN_CHUNK_SIZE == 0:
+            if (token_idx - start) % chunk_size == 0:
                 chunk_states.append(state.clone())
                 chunk_g = torch.zeros(value_heads, dtype=torch.float32)
             q_t = q[batch_idx, token_idx]
@@ -111,7 +110,7 @@ def recurrent_reference(
             output[batch_idx, token_idx] = torch.einsum("hk,hkv->hv", q_t, state)
         final_states.append(state.clone())
     if cu_seqlens is None:
-        num_chunks = (seqlen + GDN_CHUNK_SIZE - 1) // GDN_CHUNK_SIZE
+        num_chunks = (seqlen + chunk_size - 1) // chunk_size
         h = torch.stack(chunk_states).reshape(batch, num_chunks, value_heads, key_dim, value_dim)
     else:
         h = torch.stack(chunk_states).unsqueeze(0)
@@ -275,22 +274,17 @@ def to_cpu(value: Any) -> Any:
 
 def generate_reference(args: argparse.Namespace) -> Path:
     device = resolve_device(args.device)
-    if args.chunk_size != GDN_CHUNK_SIZE:
-        raise ValueError(f"vLLM Ascend FLA uses a fixed chunk_size of {GDN_CHUNK_SIZE}")
+    if args.chunk_size <= 0 or args.chunk_size & (args.chunk_size - 1):
+        raise ValueError("chunk_size must be a positive power of two")
     if args.vH < args.kH or args.vH % args.kH:
         raise ValueError("vH must be greater than or equal to kH and divisible by kH")
 
     if device.type == "cuda":
-        from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule
+        from vllm.model_executor.layers.fla.ops.chunk_o import chunk_fwd_o
     else:
         install_minimal_vllm_shim()
         install_lightweight_ascend_packages()
-        import vllm_ascend.ops.triton.fla.chunk as ascend_chunk
-
-        # The kernel only needs PCP collectives when world_size > 1. Keep this
-        # standalone single-device generator independent of distributed setup.
-        ascend_chunk.get_pcp_group = lambda: SimpleNamespace(world_size=1, rank_in_group=0)
-        chunk_gated_delta_rule = ascend_chunk.chunk_gated_delta_rule
+        from vllm_ascend.ops.triton.fla.chunk_o import chunk_fwd_o
 
     dtype = parse_dtype(args.dtype)
     cu_seqlens = parse_cu_seqlens(args.cu_seqlens, args.B, args.T)
@@ -299,20 +293,26 @@ def generate_reference(args: argparse.Namespace) -> Path:
     scale = args.scale if args.scale is not None else args.D**-0.5
 
     fp32_o, fp32_final_state, fwd_o_v, fwd_o_h, fwd_o_g = recurrent_reference(
-        **tensors, scale=scale, cu_seqlens=cu_seqlens
+        **tensors,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=args.chunk_size,
     )
     kernel_status = "executed"
     kernel_error = None
     try:
         synchronize(device)
-        ref_o, final_state = chunk_gated_delta_rule(
-            **tensors,
+        ref_o = chunk_fwd_o(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=fwd_o_v.to(device=device, dtype=dtype),
+            h=fwd_o_h.to(device=device, dtype=dtype),
+            g=fwd_o_g.to(device),
             scale=scale,
-            initial_state=None,
-            output_final_state=True,
             cu_seqlens=cu_tensor,
-            head_first=False,
+            chunk_size=args.chunk_size,
         )
+        final_state = fp32_final_state.to(dtype)
         synchronize(device)
     except Exception as exc:  # Triton/CANN compiler errors are backend-specific.
         if not args.allow_fallback:

@@ -17,9 +17,6 @@ from generate_fla_gdn_ref import (  # noqa: E402
     install_minimal_vllm_shim,
 )
 
-CHUNK_SIZE = 64
-
-
 def dtype_of(name: str) -> torch.dtype:
     return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[name]
 
@@ -55,7 +52,7 @@ def solve_tril_cpu(a_matrix: torch.Tensor, cu_seqlens: list[int] | None) -> torc
     return result.to(dtype=a_matrix.dtype, device=a_matrix.device)
 
 
-def fwd_h_reference(k, w, u, g, initial_state, cu_seqlens, output_final_state):
+def fwd_h_reference(k, w, u, g, initial_state, cu_seqlens, output_final_state, chunk_size):
     k, w, u, g = [x.detach().cpu().float() for x in (k, w, u, g)]
     bsz, seqlen, kh, dim = k.shape
     vh, vdim = u.shape[2:]
@@ -70,8 +67,8 @@ def fwd_h_reference(k, w, u, g, initial_state, cu_seqlens, output_final_state):
     for seq, start, end in spans:
         state = torch.zeros(vh, dim, vdim) if state0 is None else state0[len(final)].clone()
         ratio = vh // kh
-        for chunk_start in range(start, end, CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, end)
+        for chunk_start in range(start, end, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, end)
             h_chunks.append(state.clone())
             k_chunk = k[seq, chunk_start:chunk_end].repeat_interleave(ratio, dim=1)
             w_chunk = w[seq, chunk_start:chunk_end]
@@ -84,7 +81,7 @@ def fwd_h_reference(k, w, u, g, initial_state, cu_seqlens, output_final_state):
             state = state * g_last.exp()[:, None, None]
             state = state + torch.einsum("thk,thv->hkv", k_chunk, weighted_delta)
         final.append(state)
-    chunks_per_batch = (seqlen + CHUNK_SIZE - 1) // CHUNK_SIZE if cu_seqlens is None else None
+    chunks_per_batch = (seqlen + chunk_size - 1) // chunk_size if cu_seqlens is None else None
     h = torch.stack(h_chunks).unsqueeze(0) if cu_seqlens is not None else torch.stack(h_chunks).reshape(bsz, chunks_per_batch, vh, dim, vdim)
     final_state = torch.stack(final) if output_final_state else None
     return h, v_new, final_state
@@ -99,8 +96,10 @@ def main():
     p.add_argument("--output_dir", type=Path, default=Path("/tmp/gdn_fwd_h_ref")); p.add_argument("--seed", type=int, default=24)
     p.add_argument("--state_dtype", choices=["fp16", "bf16", "fp32"], default="fp32")
     args = p.parse_args()
-    if args.chunk_size != CHUNK_SIZE or args.vH < args.kH or args.vH % args.kH:
-        raise ValueError("chunk_size must be 64 and vH must be divisible by kH")
+    if args.chunk_size <= 0 or args.vH < args.kH or args.vH % args.kH:
+        raise ValueError("chunk_size must be positive and vH must be divisible by kH")
+    if args.chunk_size not in {16, 32, 64}:
+        raise ValueError("the current solve_tril/WY pipeline supports chunk_size 16, 32, or 64")
     torch.manual_seed(args.seed)
     dtype, cu = dtype_of(args.dtype), cu_of(args.cu_seqlens, args.B, args.T)
     try:
@@ -124,14 +123,15 @@ def main():
     beta = torch.empty(args.B, args.T, args.vH, device=device, dtype=dtype).uniform_(0.12, 0.88)
     raw_g = torch.empty(args.B, args.T, args.vH, device=device, dtype=torch.float32).uniform_(-0.08, -0.002)
     cu_tensor = None if cu is None else torch.tensor(cu, device=device, dtype=torch.long)
-    chunk_indices = None if cu_tensor is None else prepare_chunk_indices(cu_tensor, CHUNK_SIZE)
-    g = chunk_local_cumsum(raw_g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_tensor)
+    chunk_indices = None if cu_tensor is None else prepare_chunk_indices(cu_tensor, args.chunk_size)
+    g = chunk_local_cumsum(raw_g, chunk_size=args.chunk_size, cu_seqlens=cu_tensor)
     a_matrix = chunk_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,
         g_cumsum=g,
         cu_seqlens=cu_tensor,
         chunk_indices=chunk_indices,
+        chunk_size=args.chunk_size,
         output_dtype=torch.float32,
     )
     a_matrix = solve_tril_cpu(a_matrix, cu)
@@ -151,7 +151,16 @@ def main():
         if args.use_initial_state
         else None
     )
-    fp32_h, fp32_v_new, fp32_final = fwd_h_reference(k, w, u, g, initial, cu, bool(args.use_final_state))
+    fp32_h, fp32_v_new, fp32_final = fwd_h_reference(
+        k,
+        w,
+        u,
+        g,
+        initial,
+        cu,
+        bool(args.use_final_state),
+        args.chunk_size,
+    )
     h, v_new, final = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
