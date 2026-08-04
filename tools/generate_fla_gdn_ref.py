@@ -202,6 +202,58 @@ def install_lightweight_ascend_packages() -> None:
         module.__package__ = name
         sys.modules[name] = module
 
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def insert_slice(ful, sub, offsets, sizes, strides):
+        if len(ful.shape) == 2:
+            rows = tl.arange(0, ful.shape[0])[:, None]
+            cols = tl.arange(0, ful.shape[1])[None, :]
+            src_rows = (rows - offsets[0]) // strides[0]
+            src_cols = (cols - offsets[1]) // strides[1]
+            mask = (
+                (rows >= offsets[0])
+                & (rows < offsets[0] + sizes[0] * strides[0])
+                & (cols >= offsets[1])
+                & (cols < offsets[1] + sizes[1] * strides[1])
+            )
+            return tl.where(mask, sub[src_rows, src_cols], ful)
+        dim0 = tl.arange(0, ful.shape[0])[:, None, None]
+        dim1 = tl.arange(0, ful.shape[1])[None, :, None]
+        dim2 = tl.arange(0, ful.shape[2])[None, None, :]
+        src0 = (dim0 - offsets[0]) // strides[0]
+        src1 = (dim1 - offsets[1]) // strides[1]
+        src2 = (dim2 - offsets[2]) // strides[2]
+        mask = (
+            (dim0 >= offsets[0])
+            & (dim0 < offsets[0] + sizes[0] * strides[0])
+            & (dim1 >= offsets[1])
+            & (dim1 < offsets[1] + sizes[1] * strides[1])
+            & (dim2 >= offsets[2])
+            & (dim2 < offsets[2] + sizes[2] * strides[2])
+        )
+        return tl.where(mask, sub[src0, src1, src2], ful)
+
+    @triton.jit
+    def extract_slice(ful, offsets, sizes, strides):
+        if len(ful.shape) == 2:
+            rows = offsets[0] + tl.arange(0, sizes[0])[:, None] * strides[0]
+            cols = offsets[1] + tl.arange(0, sizes[1])[None, :] * strides[1]
+            return ful[rows, cols]
+        dim0 = offsets[0] + tl.arange(0, sizes[0])[:, None, None] * strides[0]
+        dim1 = offsets[1] + tl.arange(0, sizes[1])[None, :, None] * strides[1]
+        dim2 = offsets[2] + tl.arange(0, sizes[2])[None, None, :] * strides[2]
+        return ful[dim0, dim1, dim2]
+
+    ascend_utils = types.ModuleType("vllm_ascend.ops.triton.triton_utils")
+    ascend_utils.insert_slice = insert_slice
+    ascend_utils.extract_slice = extract_slice
+    ascend_utils.get_element = lambda tensor, *indices: tensor[indices]
+    ascend_utils.get_vectorcore_num = lambda: 1
+    ascend_utils.get_aicore_num = lambda: 1
+    ascend_utils.init_device_properties_triton = lambda: None
+    sys.modules["vllm_ascend.ops.triton.triton_utils"] = ascend_utils
+
 
 def accuracy_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     actual, expected = actual.detach().cpu().float(), expected.detach().cpu().float()
