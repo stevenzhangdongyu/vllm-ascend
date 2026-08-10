@@ -15,6 +15,12 @@ from vllm.triton_utils import tl, triton
 from .utils import prepare_chunk_indices
 
 
+def get_cumsum_block_size(head_count: int, chunk_size: int) -> int:
+    """Choose a power-of-two block containing at least one complete chunk."""
+    target_size = (2**18) // (head_count * chunk_size)
+    return max(chunk_size, triton.next_power_of_2(target_size))
+
+
 @triton.heuristics(
     {"HAS_SCALE": lambda args: args["scale"] is not None, "IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
 )
@@ -89,7 +95,7 @@ def chunk_local_cumsum_scalar(
     else:
         B, T, H = g.shape
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be a power of 2"
-    OPTIM_BLOCK_SIZE = triton.next_power_of_2((2**18) // (H * chunk_size))
+    OPTIM_BLOCK_SIZE = get_cumsum_block_size(H, chunk_size)
     if cu_seqlens is not None and block_indices is None:
         block_indices = prepare_chunk_indices(cu_seqlens, chunk_size=OPTIM_BLOCK_SIZE)
     num_blocks = len(block_indices) if cu_seqlens is not None else triton.cdiv(T, OPTIM_BLOCK_SIZE)
