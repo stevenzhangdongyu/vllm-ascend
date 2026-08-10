@@ -14,7 +14,7 @@ usage() {
     cat <<'EOF'
 Usage:
   profile_gdn_fwd_h_case.sh [OPTIONS] -- \
-    B T kH vH D VDim isVariedLen chunkSize useInitialState storeFinalState \
+    B T kH vH D VDim isVariedLen tokenBatch chunkSize useInitialState storeFinalState \
     dtype useActualInput useActualOutput dataPath device gDType stateDType
 
 Options:
@@ -28,7 +28,7 @@ Options:
 Example:
   bash tools/profile_gdn_fwd_h_case.sh \
     --test-script=./test_fwd_h_1.py --output=./prof -- \
-    1 1024 16 32 128 128 0 64 0 0 bf16 1 0 ./input.pt 0 float fp32
+    1 1024 16 32 128 128 0 1 64 0 0 bf16 1 0 ./input.pt 0 float fp32
 EOF
 }
 
@@ -46,8 +46,8 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-if [[ $# -ne 17 ]]; then
-    echo "ERROR: expected 17 case arguments after --, got $#" >&2
+if [[ $# -ne 18 ]]; then
+    echo "ERROR: expected 18 case arguments after --, got $#" >&2
     usage
     exit 2
 fi
@@ -76,16 +76,17 @@ VH=$4
 D=$5
 VDIM=$6
 IS_VARLEN=$7
-CHUNK_SIZE=$8
-USE_INITIAL_STATE=$9
-STORE_FINAL_STATE=${10}
-DTYPE=${11}
-USE_ACTUAL_INPUT=${12}
-USE_ACTUAL_OUTPUT=${13}
-DATA_PATH=${14}
-DEVICE=${15}
-G_DTYPE=${16}
-STATE_DTYPE=${17}
+TOKEN_BATCH=$8
+CHUNK_SIZE=$9
+USE_INITIAL_STATE=${10}
+STORE_FINAL_STATE=${11}
+DTYPE=${12}
+USE_ACTUAL_INPUT=${13}
+USE_ACTUAL_OUTPUT=${14}
+DATA_PATH=${15}
+DEVICE=${16}
+G_DTYPE=${17}
+STATE_DTYPE=${18}
 
 for binary_flag in "$IS_VARLEN" "$USE_INITIAL_STATE" "$STORE_FINAL_STATE" "$USE_ACTUAL_INPUT" "$USE_ACTUAL_OUTPUT"; do
     if [[ "$binary_flag" != "0" && "$binary_flag" != "1" ]]; then
@@ -105,7 +106,7 @@ mkdir -p "$OUTPUT_DIR"
 
 APP_CMD=(
     "$PYTHON_BIN" "$TEST_SCRIPT"
-    "$B" "$T" "$KH" "$VH" "$D" "$VDIM" "$IS_VARLEN" "$CHUNK_SIZE"
+    "$B" "$T" "$KH" "$VH" "$D" "$VDIM" "$IS_VARLEN" "$TOKEN_BATCH" "$CHUNK_SIZE"
     "$USE_INITIAL_STATE" "$STORE_FINAL_STATE" "$DTYPE" "$USE_ACTUAL_INPUT"
     "$USE_ACTUAL_OUTPUT" "$DATA_PATH" "$DEVICE" "$G_DTYPE" "$STATE_DTYPE"
 )

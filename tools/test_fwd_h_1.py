@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -50,6 +51,13 @@ def validate_shape(name: str, tensor: torch.Tensor, expected: tuple[int, ...]) -
         raise ValueError(f"{name} shape must be {expected}, got {tuple(tensor.shape)}")
 
 
+def get_reference_output(data: dict, name: str) -> torch.Tensor:
+    for key in (name, f"ref_{name}"):
+        if key in data:
+            return data[key]
+    raise KeyError(f"reference file is missing output field {name!r} (or ref_{name!s})")
+
+
 def load_reference(args: argparse.Namespace, device: torch.device):
     if not args.data_path.is_file():
         raise FileNotFoundError(f"reference file not found: {args.data_path}")
@@ -67,13 +75,31 @@ def load_reference(args: argparse.Namespace, device: torch.device):
     if initial_state is not None:
         initial_state = initial_state.to(device=device, dtype=args.state_dtype).contiguous()
     cu_seqlens = data.get("cu_seqlens") if args.is_varied_len else None
+    stored_cu_seqlens = data.get("cu_seqlens")
+    if args.is_varied_len == 0 and stored_cu_seqlens is not None:
+        raise ValueError(
+            "case is marked fixed-length (is_varied_len=0), but the reference contains cu_seqlens; "
+            "rerun with is_varied_len=1"
+        )
+    if args.is_varied_len == 1 and stored_cu_seqlens is None:
+        raise ValueError(
+            "case is marked variable-length (is_varied_len=1), but the reference has no cu_seqlens"
+        )
+    if args.is_varied_len and stored_cu_seqlens is not None:
+        stored_token_batch = int(stored_cu_seqlens.numel() - 1)
+        if stored_token_batch != args.token_batch:
+            raise ValueError(
+                f"token_batch mismatch: command token_batch={args.token_batch}, "
+                f"reference contains {stored_token_batch} sequences from cu_seqlens; "
+                "pass the logical sequence count as token_batch"
+            )
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long).unique().contiguous()
     return data, k, w, u, g, initial_state, cu_seqlens
 
 
 def generate_inputs(args: argparse.Namespace, device: torch.device):
-    shape_batch = 1 if args.is_varied_len else args.batch
+    shape_batch = args.batch
     k = torch.normal(
         0.0109,
         0.0979,
@@ -104,7 +130,7 @@ def generate_inputs(args: argparse.Namespace, device: torch.device):
     ).uniform_(-0.08, -0.002)
     cu_seqlens = None
     if args.is_varied_len:
-        lengths = [args.seqlen // args.batch] * args.batch
+        lengths = [args.seqlen // args.token_batch] * args.token_batch
         lengths[-1] += args.seqlen - sum(lengths)
         cu_values = [0]
         for length in lengths:
@@ -118,7 +144,7 @@ def generate_inputs(args: argparse.Namespace, device: torch.device):
             chunk_end = min(chunk_start + args.chunk_size, end)
             raw_g[batch_id, chunk_start:chunk_end] = raw_g[batch_id, chunk_start:chunk_end].cumsum(0)
     g = raw_g.to(device=device, dtype=args.g_dtype)
-    sequence_count = args.batch
+    sequence_count = args.batch * args.token_batch
     initial_state = None
     if args.use_initial_state:
         initial_state = torch.normal(
@@ -131,17 +157,64 @@ def generate_inputs(args: argparse.Namespace, device: torch.device):
     return None, k, w, u, g, initial_state, cu_seqlens
 
 
-def compare_tensor(name: str, actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype) -> None:
-    expected = expected.to(dtype=dtype)
-    actual = actual.detach().cpu().to(dtype=dtype)
-    atol, rtol = (2e-2, 2e-2) if dtype == torch.float16 else (5e-2, 5e-2)
-    error = (actual.float() - expected.float()).abs()
-    cosine = torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
-    print(
-        f"[Accuracy] {name}: max_abs={error.max().item():.6e}, "
-        f"mean_abs={error.mean().item():.6e}, cosine={cosine.item():.8f}"
+def compare_tensor(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    expected = expected.detach().cpu().float()
+    actual = actual.detach().cpu().float()
+    if actual.shape != expected.shape:
+        raise ValueError(
+            f"{name} shape mismatch: actual={tuple(actual.shape)}, "
+            f"reference={tuple(expected.shape)}; check is_varied_len, batch, "
+            "seqlen, and chunk_size"
+        )
+    absolute_error = (actual - expected).abs()
+    denominator_floor = (1.0 / (1 << 14)) / args.diff_threshold
+    denominator = torch.maximum(actual.abs(), expected.abs()).clamp_min(denominator_floor) + 1e-9
+    metric_error = torch.where(
+        absolute_error < args.diff_threshold,
+        absolute_error,
+        absolute_error / denominator,
     )
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    finite = torch.isfinite(actual) & torch.isfinite(expected)
+    passed = (metric_error <= args.diff_threshold) & finite
+    total = actual.numel()
+    passed_count = int(passed.sum())
+    pass_percent = passed_count / total * 100.0
+    max_metric_error = float(metric_error.nan_to_num(nan=math.inf, posinf=math.inf).max())
+    failure_ratio = 1.0 - passed_count / total
+    success = failure_ratio <= args.failure_ratio and max_metric_error < args.max_error
+    cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+    print(
+        f"[Accuracy] {name}: {'PASS' if success else 'FAIL'}, total={total}, "
+        f"passed={pass_percent:.6f}%, max_error={max_metric_error:.6e}, "
+        f"max_abs={absolute_error.max().item():.6e}, "
+        f"mean_abs={absolute_error.mean().item():.6e}, cosine={cosine.item():.8f}"
+    )
+    failed_indices = (~passed).nonzero(as_tuple=False)[: args.max_failures]
+    for index in failed_indices:
+        coordinates = tuple(int(value) for value in index)
+        print(
+            f"[Mismatch] {name}{coordinates}: expected={expected[coordinates].item():.8e}, "
+            f"actual={actual[coordinates].item():.8e}, "
+            f"abs={absolute_error[coordinates].item():.8e}, "
+            f"error={metric_error[coordinates].item():.8e}"
+        )
+    return {
+        "name": name,
+        "passed": success,
+        "shape": list(actual.shape),
+        "total": total,
+        "passed_count": passed_count,
+        "pass_percent": pass_percent,
+        "max_error": max_metric_error,
+        "max_abs_error": float(absolute_error.max()),
+        "mean_abs_error": float(absolute_error.mean()),
+        "cosine_similarity": float(cosine),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("k_dim", type=int)
     parser.add_argument("v_dim", type=int)
     parser.add_argument("is_varied_len", type=int, choices=[0, 1])
+    parser.add_argument("token_batch", type=int)
     parser.add_argument("chunk_size", type=int)
     parser.add_argument("use_initial_state", type=int, choices=[0, 1])
     parser.add_argument("store_final_state", type=int, choices=[0, 1])
@@ -163,13 +237,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("device", type=int)
     parser.add_argument("g_dtype", type=parse_dtype)
     parser.add_argument("state_dtype", type=parse_dtype)
+    parser.add_argument("--diff-threshold", type=float, default=0.001)
+    parser.add_argument("--failure-ratio", type=float, default=0.0001)
+    parser.add_argument("--max-error", type=float, default=0.1)
+    parser.add_argument("--max-failures", type=int, default=20)
+    parser.add_argument("--report-json", type=Path)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if min(args.batch, args.seqlen, args.k_heads, args.v_heads, args.k_dim, args.v_dim, args.chunk_size) <= 0:
+    if min(args.batch, args.token_batch, args.seqlen, args.k_heads, args.v_heads, args.k_dim, args.v_dim,
+           args.chunk_size) <= 0:
         raise ValueError("all dimensions and chunk_size must be positive")
+    if not args.is_varied_len and args.token_batch != 1:
+        raise ValueError("fixed-length mode requires token_batch=1")
+    if args.is_varied_len and args.batch != 1:
+        raise ValueError("variable-length flattened input requires batch=1")
+    if not 0 <= args.failure_ratio < 1 or args.diff_threshold <= 0 or args.max_error <= 0:
+        raise ValueError("comparison thresholds must be positive and failure_ratio must be less than 1")
+    if args.max_failures < 0:
+        raise ValueError("max_failures must be non-negative")
     if args.v_heads < args.k_heads or args.v_heads % args.k_heads:
         raise ValueError("v_heads must be divisible by k_heads")
     if args.use_actual_output and not args.use_actual_input:
@@ -186,7 +274,7 @@ def main() -> None:
     else:
         data, k, w, u, g, initial_state, cu_seqlens = generate_inputs(args, device)
 
-    shape_batch = 1 if args.is_varied_len else args.batch
+    shape_batch = args.batch
     validate_shape("k", k, (shape_batch, args.seqlen, args.k_heads, args.k_dim))
     validate_shape("w", w, (shape_batch, args.seqlen, args.v_heads, args.k_dim))
     validate_shape("u", u, (shape_batch, args.seqlen, args.v_heads, args.v_dim))
@@ -226,13 +314,31 @@ def main() -> None:
     if args.use_actual_output:
         if data is None:
             raise RuntimeError("reference output is unavailable")
-        compare_tensor("h", h, data["h"], args.dtype)
-        compare_tensor("v_new", v_new, data["v_new"], args.dtype)
+        reports = [
+            compare_tensor("h", h, get_reference_output(data, "h"), args),
+            compare_tensor("v_new", v_new, get_reference_output(data, "v_new"), args),
+        ]
         expected_final = data.get("final_state")
         if args.store_final_state:
             if final_state is None or expected_final is None:
                 raise ValueError("final_state is required by store_final_state=1")
-            compare_tensor("final_state", final_state, expected_final, args.state_dtype)
+            reports.append(compare_tensor("final_state", final_state, expected_final, args))
+        overall_passed = all(bool(report["passed"]) for report in reports)
+        report = {
+            "passed": overall_passed,
+            "thresholds": {
+                "diff_threshold": args.diff_threshold,
+                "failure_ratio": args.failure_ratio,
+                "max_error": args.max_error,
+            },
+            "tensors": reports,
+        }
+        if args.report_json:
+            args.report_json.parent.mkdir(parents=True, exist_ok=True)
+            args.report_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            print(f"[Report] {args.report_json}")
+        if not overall_passed:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
