@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.metadata
 import sys
 from pathlib import Path
 
@@ -95,6 +96,7 @@ def main():
     p.add_argument("use_initial_state", type=int, choices=[0, 1]); p.add_argument("use_final_state", type=int, choices=[0, 1])
     p.add_argument("--output_dir", type=Path, default=Path("/tmp/gdn_fwd_h_ref")); p.add_argument("--seed", type=int, default=24)
     p.add_argument("--state_dtype", choices=["fp16", "bf16", "fp32"], default="fp32")
+    p.add_argument("--device", type=int, default=0)
     args = p.parse_args()
     if args.chunk_size <= 0 or args.vH < args.kH or args.vH % args.kH:
         raise ValueError("chunk_size must be positive and vH must be divisible by kH")
@@ -108,7 +110,26 @@ def main():
         raise RuntimeError("This generator requires an Ascend torch_npu environment") from None
     if not torch.npu.is_available():
         raise RuntimeError("No Ascend NPU is available")
-    device = "npu"
+    torch.npu.set_device(args.device)
+    device = f"npu:{args.device}"
+    try:
+        from triton.runtime.driver import driver as triton_driver
+
+        triton_driver.active.get_current_device()
+    except Exception as error:
+        distributions = []
+        for name in ("triton", "triton-ascend"):
+            try:
+                distributions.append(f"{name}=={importlib.metadata.version(name)}")
+            except importlib.metadata.PackageNotFoundError:
+                pass
+        installed = ", ".join(distributions) or "no Triton distribution metadata found"
+        raise RuntimeError(
+            "Triton cannot find an active Ascend driver. This is an environment installation problem, "
+            "not a case-shape or chunk-size problem. Ensure the current Python environment contains "
+            "a Triton-Ascend build compatible with torch_npu/CANN and that the CANN environment has "
+            f"been sourced. Detected: {installed}. Original error: {error}"
+        ) from error
     install_minimal_vllm_shim()
     install_lightweight_ascend_packages()
     from vllm_ascend.ops.triton.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
